@@ -9,8 +9,9 @@ import urllib.request
 import urllib.parse
 
 # ---------------- 配置区(改成你自己的) ----------------
-ACCOUNT = "2025xxxxxx@telecom"   # 完整账号(含运营商后缀)
+ACCOUNT = "2025xxxxxx"           # 学号/工号(不含运营商后缀)
 PASSWORD = "xxxxxxxx"            # 密码
+OPERATOR = "telecom"             # 运营商: telecom(电信)/cmcc(移动)/unicom(联通); 无运营商则留空
 GATEWAY = "10.255.254.1"         # 认证服务器IP
 PORT = "801"                     # 认证端口
 INTERVAL = 1                     # 检测间隔(秒)
@@ -53,7 +54,8 @@ def is_online():
 
 def login():
     ip, mac = get_local_info()
-    acct = urllib.parse.quote(ACCOUNT, safe="")
+    full_acct = ACCOUNT + ("@" + OPERATOR if OPERATOR else "")
+    acct = urllib.parse.quote(full_acct, safe="")
     url = (
         f"http://{GATEWAY}:{PORT}/eportal/?c=Portal&a=login"
         f"&callback=dr1003&login_method=1"

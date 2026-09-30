@@ -7,8 +7,9 @@
 #   ./campus_router.sh login|logout|status
 
 # ---------------- 配置区(改成你自己的) ----------------
-ACCOUNT="2025xxxxxx@telecom"     # 完整账号(含运营商后缀)
+ACCOUNT="2025xxxxxx"            # 学号/工号(不含运营商后缀)
 PASSWORD="xxxxxxxx"             # 密码
+OPERATOR="telecom"              # 运营商: telecom(电信)/cmcc(移动)/unicom(联通); 无运营商则留空
 GATEWAY="10.255.254.1"          # 认证服务器IP
 PORT="801"                      # 认证端口
 INTERVAL=1                      # 检测间隔(秒)
@@ -48,8 +49,10 @@ is_online() {
 login() {
     get_wan_info
     [ -z "$WAN_IP" ] && { log "登录失败: 无法获取 WAN IP"; return 1; }
-    local enc_acct url resp
-    enc_acct=$(echo "$ACCOUNT" | sed 's/@/%40/g')
+    local full_acct enc_acct url resp
+    full_acct="$ACCOUNT"
+    [ -n "$OPERATOR" ] && full_acct="${ACCOUNT}@${OPERATOR}"
+    enc_acct=$(echo "$full_acct" | sed 's/@/%40/g')
     url="http://${GATEWAY}:${PORT}/eportal/?c=Portal&a=login&callback=dr1003&login_method=1&user_account=%2C0%2C${enc_acct}&user_password=${PASSWORD}&wlan_user_ip=${WAN_IP}&wlan_user_mac=${WAN_MAC}&jsVersion=3.3.2&v=8980"
     resp=$(curl -s -m 10 "$url" 2>/dev/null)
     if echo "$resp" | grep -q '"result":"1"'; then

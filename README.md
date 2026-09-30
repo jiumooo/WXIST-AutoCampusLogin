@@ -41,8 +41,8 @@ Dr.COM 校园网认证（eportal 页面）本质上是几个**明文 HTTP GET �
 | 认证服务器 IP | `10.255.254.1` | 学校认证网关，不同学校不同 |
 | 认证端口 | `801` | eportal 服务端口（部分学校是 80） |
 | 认证路径 | `/eportal/` | 学生认证入口 |
-| 账号 | `你的账号` | 学号 / 工号 |
-| 运营商后缀 | `@telecom` | 电信 `@telecom`、移动 `@cmcc`、联通 `@unicom`；无运营商则留空 |
+| 账号 | `你的学号` | 学号 / 工号（**不含**运营商后缀，见下行） |
+| 运营商 | `telecom` | 三选一：电信 `telecom`、移动 `cmcc`、联通 `unicom`；单运营商学校可留空 |
 | 密码 | `你的密码` | 校园网密码 |
 | WAN IP / MAC | **动态获取** | 不要写死，见下文 |
 
@@ -137,8 +137,9 @@ http://<认证服务器IP>:801/eportal/?c=Portal&a=logout
 # 校园网自动登录/注销脚本 (OpenWrt / ImmortalWrt)
 
 # ---------------- 配置区(改成你自己的) ----------------
-ACCOUNT="2025xxxxxx@telecom"     # 完整账号(含运营商后缀)
+ACCOUNT="2025xxxxxx"            # 学号/工号(不含运营商后缀)
 PASSWORD="xxxxxxxx"             # 密码
+OPERATOR="telecom"              # 运营商: telecom(电信)/cmcc(移动)/unicom(联通); 无运营商则留空
 GATEWAY="10.255.254.1"          # 认证服务器IP
 PORT="801"                      # 认证端口
 PING_TARGETS="223.5.5.5 119.29.29.29"
@@ -193,8 +194,10 @@ is_online() {
 login() {
     get_wan_info
     [ -z "$WAN_IP" ] && { log "登录失败: 无法获取WAN IP"; return 1; }
-    local enc_acct
-    enc_acct=$(echo "$ACCOUNT" | sed 's/@/%40/g')
+    local full_acct enc_acct
+    full_acct="$ACCOUNT"
+    [ -n "$OPERATOR" ] && full_acct="${ACCOUNT}@${OPERATOR}"
+    enc_acct=$(echo "$full_acct" | sed 's/@/%40/g')
     local url="http://${GATEWAY}:${PORT}/eportal/?c=Portal&a=login&callback=dr1003&login_method=1&user_account=%2C0%2C${enc_acct}&user_password=${PASSWORD}&wlan_user_ip=${WAN_IP}&wlan_user_mac=${WAN_MAC}&jsVersion=3.3.2&v=8980"
     local resp
     resp=$(http_get "$url")
@@ -348,8 +351,9 @@ import platform
 import json
 
 # ---------------- 配置区 ----------------
-ACCOUNT = "2025xxxxxx@telecom"   # 完整账号
+ACCOUNT = "2025xxxxxx"           # 学号/工号(不含运营商后缀)
 PASSWORD = "xxxxxxxx"            # 密码
+OPERATOR = "telecom"             # 运营商: telecom(电信)/cmcc(移动)/unicom(联通); 无运营商则留空
 GATEWAY = "10.255.254.1"         # 认证服务器IP
 PORT = "801"
 INTERVAL = 1                     # 检测间隔(秒)
@@ -408,7 +412,8 @@ def is_online():
 
 def login():
     ip, mac = get_local_info()
-    acct = urllib.parse.quote(ACCOUNT, safe="")
+    full_acct = ACCOUNT + ("@" + OPERATOR if OPERATOR else "")
+    acct = urllib.parse.quote(full_acct, safe="")
     url = (f"http://{GATEWAY}:{PORT}/eportal/?c=Portal&a=login"
            f"&callback=dr1003&login_method=1"
            f"&user_account=%2C0%2C{acct}&user_password={PASSWORD}"
@@ -472,8 +477,9 @@ if __name__ == "__main__":
 
 ```powershell
 # campus.ps1 —— 校园网自动重连
-$Account = "2025xxxxxx@telecom"
+$Account = "2025xxxxxx"          # 学号/工号(不含运营商后缀)
 $Password = "xxxxxxxx"
+$Operator = "telecom"            # 运营商: telecom/cmcc/unicom; 无运营商则留空
 $Gateway = "10.255.254.1"
 $Port = "801"
 
@@ -497,7 +503,8 @@ function Test-Online {
 while ($true) {
     if (-not (Test-Online)) {
         $info = Get-WanInfo
-        $acct = [uri]::EscapeDataString($Account)
+        $fullAcct = $Account + $(if ($Operator) { "@" + $Operator } else { "" })
+        $acct = [uri]::EscapeDataString($fullAcct)
         $url = "http://${Gateway}:${Port}/eportal/?c=Portal&a=login" +
             "&callback=dr1003&login_method=1" +
             "&user_account=%2C0%2C$acct&user_password=$Password" +
@@ -535,7 +542,7 @@ while ($true) {
 3. **端口与路径边界。** 学生认证只调用 `/eportal/?c=Portal&a=login|logout`；不要访问后台管理路径（如 `?c=main`），以免误操作。
 4. **已在线返回 `ret_code:2` 是正常的**，不代表登录失败；只有出现 `"result":"1"` 才是本次认证成功。
 5. **检测频率。** 路由器 busybox 的 `sleep` 通常只支持整数秒，1 秒一次是兼顾实时性与资源占用的合理选择；实测断线到重连约 1~3 秒。
-6. **运营商后缀**按你的套餐选择，选错可能登录失败；不确定时先在网页端确认一次完整账号。
+6. **运营商按套餐选择**：电信填 `telecom`、移动填 `cmcc`、联通填 `unicom`，脚本会自动拼成 `学号@运营商`；选错会登录失败。不确定时先在网页端登录一次，看浏览器地址栏里完整账号的后缀是什么。单运营商学校（无需后缀）把 `OPERATOR` 留空即可。
 7. **合规使用。** 本项目仅用于学习交流与个人网络维护，请遵守学校网络管理规定，不要用于绕过计费或共享账号。
 
 ---
