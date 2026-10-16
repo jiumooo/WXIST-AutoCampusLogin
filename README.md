@@ -2,9 +2,9 @@
 
 基于 **Dr.COM（哆点 eportal）** 认证的校园网**自动登录 / 断线自动重连**方案。本项目逆向分析了校园网认证协议，并提供**路由器（OpenWrt / ImmortalWrt）**与**电脑（Windows / macOS / Linux）**两套可直接使用的脚本，支持：
 
-- **登录接口探测自愈**：直接调用认证网关的登录接口做在线探测——一次请求同时完成"在线检测"和"掉线重连"，掉线后下一个探测周期（默认 5 秒）内自动恢复，不需要等外网超时；
-- 每天定时注销并重新登录（防止会话老化，默认 8:00）；
-- 可选：通过企业微信群机器人推送掉线 / 重连通知（含断线到重连耗时，精确到 0.01 秒）。
+- 实时检测网络连通性，断线后自动重连（本次更新：改为**登录接口探测自愈**，掉线后 5 秒内自动恢复）；
+- 每天定时注销并重新登录（防止会话老化）；
+- 可选：通过企业微信群机器人推送掉线 / 重连通知（含断线到重连耗时）。
 
 > 本文所有账号、密码、Webhook 均已脱敏，使用时替换为你自己的信息即可。
 
@@ -12,7 +12,7 @@
 
 ## 🔄 本次重大更新（2026-10）：检测方式改为"登录接口探测自愈"
 
-旧版脚本用**外网 HTTP 探测**判断是否掉线（访问百度 / generate_204，200/204 视为在线），掉线后**再**调登录接口重连——"检测"和"重连"是两步。本次更新彻底改变检测机制，实测发现并验证了一个更优方案：
+旧版脚本用**外网 HTTP 探测**判断是否掉线（访问百度 / generate_204，200/204 视为在线），掉线后**再**调登录接口重连——"检测"和"重连"是两步。本次更新改变检测机制，实测发现并验证了一个更优方案。
 
 ### 新旧方案对比
 
@@ -25,7 +25,7 @@
 | 依赖 | 依赖 DNS / 外网可达性 | **不依赖外网**，直连内网认证网关 |
 | 误判风险 | 外网抖动、DNS 劫持、运营商拦截都可能误报 | 网关直判在线状态，几乎无误判 |
 | 对网关影响 | 探测外网 + 登录两个请求 | 仅一个登录请求，网关幂等处理（在线时只查表，不重复认证/不计费） |
-| 请求频率 | 1 秒一次（保守起见调低） | 5 秒一次即可，负担更小 |
+| 请求频率 | 1 秒一次 | 5 秒一次即可，负担更小 |
 | 实测恢复耗时 | 掉线 1~3 秒恢复（依赖外网超时） | 掉线后 5 秒内自动恢复，实测 5.15 秒 |
 
 ### 为什么"探测登录接口"不会导致重复登录 / 被踢下线
@@ -302,6 +302,53 @@ sh -n /etc/xiaoyuan/campus_monitor.sh
 - **macOS / Linux**：`nohup python3 campus_pc.py &`，或写成 systemd / launchd 服务。
 
 > ⚠️ 电脑直连校园网（网线插墙 / 连校园 WiFi）时用。如果电脑在路由器下面（拿内网 IP），`wlan_user_ip` 会是 192.168.x.x，网关会拒绝——此时应该用路由器方案。
+
+### 5.2 Windows PowerShell 轻量版
+
+```powershell
+# campus.ps1 —— 校园网自动重连 (登录接口探测自愈)
+$Account = "2025xxxxxx"          # 学号/工号(不含运营商后缀)
+$Password = "xxxxxxxx"
+$Operator = "telecom"            # 运营商: telecom/cmcc/unicom; 无运营商则留空
+$Gateway = "10.255.254.1"
+$Port = "801"
+$Interval = 5                    # 探测间隔(秒)
+
+function Get-WanInfo {
+    $ip = (Get-NetIPConfiguration | Where-Object {
+        $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up"
+    } | Select-Object -First 1).IPv4Address.IPAddress
+    $mac = ((Get-NetAdapter | Where-Object Status -eq "Up" |
+        Select-Object -First 1).MacAddress -replace ":", "").ToUpper()
+    return @{ Ip = $ip; Mac = $mac }
+}
+
+function Invoke-Probe {
+    # 登录接口探测自愈: 返回 0=在线 1=掉线已自愈 2=登录失败 3=网关不可达
+    $info = Get-WanInfo
+    $fullAcct = $Account + $(if ($Operator) { "@" + $Operator } else { "" })
+    $acct = [uri]::EscapeDataString($fullAcct)
+    $url = "http://${Gateway}:${Port}/eportal/?c=Portal&a=login" +
+        "&callback=dr1003&login_method=1" +
+        "&user_account=%2C0%2C$acct&user_password=$Password" +
+        "&wlan_user_ip=$($info.Ip)&wlan_user_mac=$($info.Mac)" +
+        "&jsVersion=3.3.2&v=8980"
+    try {
+        $resp = (Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing).Content
+        if ($resp -match '"ret_code":2') { return 0 }
+        if ($resp -match '"result":"1"') { return 1 }
+        return 2
+    } catch { return 3 }
+}
+
+while ($true) {
+    $rc = Invoke-Probe
+    if ($rc -eq 1) {
+        Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') 掉线自动重连成功"
+    }
+    Start-Sleep -Seconds $Interval
+}
+```
 
 ---
 
