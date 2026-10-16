@@ -2,11 +2,39 @@
 
 基于 **Dr.COM（哆点 eportal）** 认证的校园网**自动登录 / 断线自动重连**方案。本项目逆向分析了校园网认证协议，并提供**路由器（OpenWrt / ImmortalWrt）**与**电脑（Windows / macOS / Linux）**两套可直接使用的脚本，支持：
 
-- 实时（每秒）检测网络连通性，断线后 1~3 秒内自动重连；
-- 每天定时注销并重新登录（防止会话老化）；
-- 可选：通过企业微信群机器人推送掉线 / 重连通知（含断线到重连耗时）。
+- **登录接口探测自愈**：直接调用认证网关的登录接口做在线探测——一次请求同时完成"在线检测"和"掉线重连"，掉线后下一个探测周期（默认 5 秒）内自动恢复，不需要等外网超时；
+- 每天定时注销并重新登录（防止会话老化，默认 8:00）；
+- 可选：通过企业微信群机器人推送掉线 / 重连通知（含断线到重连耗时，精确到 0.01 秒）。
 
 > 本文所有账号、密码、Webhook 均已脱敏，使用时替换为你自己的信息即可。
+
+---
+
+## 🔄 本次重大更新（2026-10）：检测方式改为"登录接口探测自愈"
+
+旧版脚本用**外网 HTTP 探测**判断是否掉线（访问百度 / generate_204，200/204 视为在线），掉线后**再**调登录接口重连——"检测"和"重连"是两步。本次更新彻底改变检测机制，实测发现并验证了一个更优方案：
+
+### 新旧方案对比
+
+| 维度 | 旧方案：外网 HTTP 探测 | ✅ 新方案：登录接口探测自愈 |
+|---|---|---|
+| 检测原理 | 访问百度 / generate_204，看返回码 | 直接调认证网关 **login 接口** |
+| 判断依据 | 外网 200 / 204 | 网关返回 `ret_code:2`（在线）/ `result:1`（掉线） |
+| 检测+重连 | **两步**：先探测外网，掉线后再调 login | **一步**：探测请求本身就是登录请求，掉线瞬间自动登回 |
+| 响应速度 | 掉线后要等外网连接超时（2~4 秒）才发现 | 内网网关毫秒级响应，掉线后下一个探测周期内恢复 |
+| 依赖 | 依赖 DNS / 外网可达性 | **不依赖外网**，直连内网认证网关 |
+| 误判风险 | 外网抖动、DNS 劫持、运营商拦截都可能误报 | 网关直判在线状态，几乎无误判 |
+| 对网关影响 | 探测外网 + 登录两个请求 | 仅一个登录请求，网关幂等处理（在线时只查表，不重复认证/不计费） |
+| 请求频率 | 1 秒一次（保守起见调低） | 5 秒一次即可，负担更小 |
+| 实测恢复耗时 | 掉线 1~3 秒恢复（依赖外网超时） | 掉线后 5 秒内自动恢复，实测 5.15 秒 |
+
+### 为什么"探测登录接口"不会导致重复登录 / 被踢下线
+
+Dr.COM 网关对**已在线账号**的登录请求是**幂等**的：返回 `ret_code:2`（账号已在线），只做状态查询，不重新认证、不踢下线、不重复计费。所以每 5 秒发一次登录请求**不是**"每 5 秒重新登录一次"，而是"每 5 秒问一次网关：我还在线吗？不在就顺手把我登上去"。
+
+### 为什么网关不能"主动"通知掉线
+
+实测 Dr.COM eportal 没有可用的只读状态接口（`a=index`、`a=query`、`a=getstatus` 均返回空/404），网关也不会主动推送掉线状态。所谓"断网提示"其实是**被动劫持**——访问外网时被 302 重定向到认证页，必须"有流量经过"才看得到。因此**主动探测必不可少**，而登录接口探测是所有可行探测方式里的最优解（详见 [1.1](#11-掉线检测的核心思路登录接口即探测接口)）。
 
 ---
 
@@ -29,6 +57,31 @@ Dr.COM 校园网认证（eportal 页面）本质上是几个**明文 HTTP GET �
 只要还原出这两个请求（**登录 login** 和**注销 logout**），任何能发 HTTP 请求的设备（路由器、电脑、单片机）都可以模拟登录，无需浏览器、无需验证码。
 
 认证通过前，设备只能访问校园内网；认证通过后才能访问外网。
+
+### 1.1 掉线检测的核心思路：登录接口即探测接口
+
+实测发现 Dr.COM eportal **没有可用的"只读状态查询"接口**（`a=index`、`a=query`、`a=getstatus` 等全部返回空或 404），网关也不会主动推送掉线状态。**唯一可靠响应、且自带"在线确认"语义的接口就是登录接口**。
+
+直接调登录接口探测，网关对已在线账号的处理是**幂等**的（不会重新认证、不会踢下线、不会重复计费），只是查表返回状态：
+
+| 返回内容 | 含义 | 动作 |
+|---|---|---|
+| `dr1003({"result":"0","msg":"","ret_code":2})` | **已在线**（幂等确认） | 什么都不做 |
+| `dr1003({"result":"1","msg":"认证成功"})` | **刚掉线，本次请求已自动登录成功** | 记录耗时、发通知 |
+| `dr1003({"result":"0","msg":"...","ret_code":1})` | IP 与网关记录不匹配（如传了内网 IP） | 检查 wlan_user_ip |
+| 空响应 / 超时 | 网关不可达（链路问题） | 外网探测兜底 |
+| 其他 | 登录失败（账号/密码/欠费等） | 连续失败 N 次才告警 |
+
+**为什么这是最优解**：
+- **检测 = 自愈**：掉线时，探测请求本身就把账号登回去了，不用"先检测、再登录"两步；
+- **不依赖外网**：探测目标是认证网关（内网地址），毫秒级响应，不受 DNS / 外网抖动 / 运营商劫持影响；
+- **判断准**：`ret_code:2` 是 Dr.COM 标准的"账号已在线"错误码，直接问网关"我在不在线"，而不是猜外网通不通。
+
+### 1.2 为什么不能只靠 ping / 访问外网
+
+- 校园网掉线时通常**只拦截 HTTP / 应用流量，ICMP（ping）依然能通**，纯 ping 检测会漏判；
+- 外网 HTTP 探测（百度 / generate_204）在掉线时要等连接超时（2~4 秒）才能发现，且外网抖动会误报；
+- 网关**不会主动通知你掉线**——所谓"断网提示"其实是访问外网时被 302 重定向到认证页（被动劫持），必须有流量经过才看得到。
 
 ---
 
@@ -73,14 +126,16 @@ http://10.255.254.1:801/eportal/?c=Portal&a=login&callback=dr1003&login_method=1
 | `c=Portal&a=login` | 控制器 `Portal`，动作 `login`（登录） |
 | `callback=dr1003` | JSONP 回调函数名，任意值均可，登录常用 `dr1003` |
 | `login_method=1` | 认证方式，`1` 为普通认证 |
-| `user_account=%2C0%2C账号` | 前缀 `,0,`（`%2C` 即英文逗号），后接完整账号 |
+| `user_account=%2C0%2C账号` | 前缀 `,0,`（`%2C` 即英文逗号），后接完整账号（学号@运营商） |
 | `user_password` | 密码（明文） |
-| `wlan_user_ip` | 本机 / WAN 口 IP（**动态获取**） |
+| `wlan_user_ip` | 本机 / WAN 口 IP（**动态获取**，必须是校园网分配地址） |
 | `wlan_user_mac` | 本机 / WAN 口 MAC，去冒号、大写 |
 | `jsVersion` | 前端 JS 版本号 |
 | `v` | 随机数，用于防止缓存 |
 
 > URL 编码规则：账号中的 `@` 要写成 `%40`，逗号写成 `%2C`。
+
+> ⚠️ **`wlan_user_ip` 必须填"当前设备从校园网拿到的 IP"**。如果填了内网地址（如路由器的 192.168.1.x），网关会返回 `ret_code:1` 拒绝——这是正常的，脚本只应该在拿到校园网 IP 的设备（路由器 WAN 口 / 直连校园网的电脑）上运行。
 
 ### 2.3 注销请求（GET）
 
@@ -98,15 +153,15 @@ http://<认证服务器IP>:801/eportal/?c=Portal&a=logout
 
 注意：注销使用 Dr.COM **内置固定账号** `user_account=drcom`、`user_password=123`，并带 `ac_logout=1`，**不是**你的个人账号。
 
-### 2.4 响应格式（JSONP）与成功判断
+### 2.4 响应格式（JSONP）与状态判断
 
-| 场景 | 返回内容 |
-|---|---|
-| 登录成功 | `dr1003({"result":"1","msg":"认证成功"})` |
-| 已在线（正常现象，不是错误） | `dr1003({"result":"0","msg":"","ret_code":2})` |
-| 注销成功 | `dr1004({"result":"1","msg":"注销成功"})` |
-
-**成功标志**：响应文本中包含 `"result":"1"`。
+| 场景 | 返回内容 | 判断 |
+|---|---|---|
+| 在线（幂等确认） | `dr1003({"result":"0","msg":"","ret_code":2})` | `ret_code":2` = 在线 |
+| 掉线后探测（自动登录） | `dr1003({"result":"1","msg":"认证成功"})` | `"result":"1"` = 本次已登录 |
+| IP 不匹配（内网 IP） | `dr1003({"result":"0","msg":"","ret_code":1})` | `ret_code":1` = 认证被拒，检查 IP |
+| 注销成功 | `dr1004({"result":"1","msg":"注销成功"})` | `"result":"1"` |
+| 网关不可达 | 空响应 / 超时 | 链路问题，走外网兜底 |
 
 ---
 
@@ -119,172 +174,71 @@ http://<认证服务器IP>:801/eportal/?c=Portal&a=logout
 3. 在 Network 中找到名为 `login`（或含 `a=login`）的请求，右键 **Copy → Copy link address**，即可得到完整登录链接和全部参数。
 4. 同理，点击"注销"可抓到 `logout` 请求。
 5. 认证服务器 IP 通常就是登录页面地址（如 `http://10.255.254.1:801/`）。
+6. **验证你的探测是否可用**：把登录链接里的 `wlan_user_ip` 换成你设备的校园网 IP 后，直接浏览器访问——在线时返回 `ret_code:2`，这就是你的探测接口。
 
 ---
 
 ## 四、路由器方案（OpenWrt / ImmortalWrt）
 
 思路：
-- 主脚本 `campus_auth.sh` 负责登录、注销、检测、通知；
-- 守护进程 `campus_monitor.sh` 每秒检测一次，断线立即调用主脚本重连；
+- 主脚本 `campus_auth.sh` 负责探测、登录、注销、检测、通知；
+- 守护进程 `campus_monitor.sh` 每 5 秒调用一次 `probe`（登录接口探测），掉线瞬间自动恢复并通知；
 - 用 **procd** 管理守护进程（开机自启、崩溃自动拉起）；
 - 用 **cron** 实现每天 8:00 注销重登。
 
 ### 4.1 主脚本 `campus_auth.sh`
 
+完整脚本见仓库 `campus_auth.sh`（配置区在文件头部，改成你自己的即可）。核心是 `probe_auto()`：
+
 ```sh
-#!/bin/sh
-# 校园网自动登录/注销脚本 (OpenWrt / ImmortalWrt)
-
-# ---------------- 配置区(改成你自己的) ----------------
-ACCOUNT="2025xxxxxx"            # 学号/工号(不含运营商后缀)
-PASSWORD="xxxxxxxx"             # 密码
-OPERATOR="telecom"              # 运营商: telecom(电信)/cmcc(移动)/unicom(联通); 无运营商则留空
-GATEWAY="10.255.254.1"          # 认证服务器IP
-PORT="801"                      # 认证端口
-PING_TARGETS="223.5.5.5 119.29.29.29"
-LOG_FILE="/var/log/campus_auth.log"
-WECOM_WEBHOOK=""                # 企业微信机器人地址, 留空则不通知
-# ------------------------------------------------------
-
-# 企业微信通知
-notify() {
-    [ -z "$WECOM_WEBHOOK" ] && return 0
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') $1"
-    local data
-    data=$(printf '{"msgtype":"text","text":{"content":"%s"}}' "$msg")
-    curl -s -m 8 -H "Content-Type: application/json" -d "$data" "$WECOM_WEBHOOK" >/dev/null 2>&1
-    log "企业微信通知已发送: $msg"
-}
-
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
-
-# 高精度时间戳(秒, 取自/proc/uptime)
-now_hp() { cut -d' ' -f1 /proc/uptime; }
-
-http_get() {
-    curl -s -m 10 "$1" 2>/dev/null
-}
-
-# 动态获取 WAN 口 IP 和 MAC (不写死)
-get_wan_info() {
-    WAN_DEV=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
-    WAN_IP=$(ip -4 -o addr show dev "$WAN_DEV" 2>/dev/null | awk '/inet /{print $4}' | cut -d/ -f1 | head -n1)
-    WAN_MAC=$(ip link show dev "$WAN_DEV" 2>/dev/null | awk '/link\/ether/{print $2}' | tr -d ':' | tr 'a-f' 'A-F')
-}
-
-# 联网检测: HTTP探测为准(校园网掉线时HTTP被拦截但ICMP可能仍通)
-is_online() {
-    if command -v curl >/dev/null 2>&1; then
-        local code u
-        for u in http://www.baidu.com http://connect.rom.miui.com/generate_204; do
-            code=$(curl -s -o /dev/null -m 4 --connect-timeout 2 --max-redirs 0 -w '%{http_code}' "$u" 2>/dev/null)
-            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
-                return 0
-            fi
-        done
-        return 1
-    fi
-    for t in $PING_TARGETS; do
-        ping -c 1 -W 1 "$t" >/dev/null 2>&1 && return 0
-    done
-    return 1
-}
-
-login() {
+# 探测并自动修复 (核心): 直接调认证网关login接口, 一次请求同时完成"在线检测"和"掉线重连"
+# 返回码: 0=在线(ret_code:2), 1=刚掉线本次已自动登录成功(result:1), 2=登录失败, 3=网关不可达
+probe_auto() {
     get_wan_info
-    [ -z "$WAN_IP" ] && { log "登录失败: 无法获取WAN IP"; return 1; }
-    local full_acct enc_acct
-    full_acct="$ACCOUNT"
-    [ -n "$OPERATOR" ] && full_acct="${ACCOUNT}@${OPERATOR}"
-    enc_acct=$(echo "$full_acct" | sed 's/@/%40/g')
-    local url="http://${GATEWAY}:${PORT}/eportal/?c=Portal&a=login&callback=dr1003&login_method=1&user_account=%2C0%2C${enc_acct}&user_password=${PASSWORD}&wlan_user_ip=${WAN_IP}&wlan_user_mac=${WAN_MAC}&jsVersion=3.3.2&v=8980"
-    local resp
-    resp=$(http_get "$url")
-    if echo "$resp" | grep -q '"result":"1"'; then
-        log "登录成功 (IP=$WAN_IP MAC=$WAN_MAC)"; return 0
-    fi
-    log "登录失败: $resp"; return 1
+    [ -z "$WAN_IP" ] && return 3
+    local enc_acct url resp
+    enc_acct=$(full_account | sed 's/@/%40/g')
+    url="http://${GATEWAY}:${PORT}/eportal/?c=Portal&a=login&callback=dr1003&login_method=1&user_account=%2C0%2C${enc_acct}&user_password=${PASSWORD}&wlan_user_ip=${WAN_IP}&wlan_user_mac=${WAN_MAC}&jsVersion=3.3.2&v=8980"
+    resp=$(curl -s -m 3 "$url")
+    [ -z "$resp" ] && return 3
+    echo "$resp" | grep -q '"ret_code":2' && return 0
+    echo "$resp" | grep -q '"result":"1"' && return 1
+    return 2
 }
-
-logout() {
-    get_wan_info
-    [ -z "$WAN_IP" ] && { log "注销失败: 无法获取WAN IP"; return 1; }
-    local url="http://${GATEWAY}:${PORT}/eportal/?c=Portal&a=logout&callback=dr1004&login_method=1&user_account=drcom&user_password=123&ac_logout=1&wlan_user_ip=${WAN_IP}&wlan_user_mac=${WAN_MAC}&v=850"
-    local resp
-    resp=$(http_get "$url")
-    if echo "$resp" | grep -q '"result":"1"'; then
-        log "注销成功"; return 0
-    fi
-    log "注销失败: $resp"; return 1
-}
-
-# 断线检测并自动登录, 成功后通知含耗时
-check() {
-    is_online && return 0
-    local t0 t1 cost i
-    t0=$(now_hp)
-    log "检测到断网, 尝试自动登录..."
-    login
-    i=0
-    while [ $i -lt 15 ]; do
-        sleep 1
-        is_online && break
-        i=$((i+1))
-    done
-    t1=$(now_hp)
-    cost=$(awk "BEGIN{printf \"%.2f\", $t1 - $t0}")
-    if is_online; then
-        log "自动登录后网络已恢复, 耗时${cost}秒"
-        notify "校园网掉线，已自动重连成功，断线到重连耗时 ${cost} 秒"
-    else
-        log "自动登录后仍无法上网, 已尝试${cost}秒"
-        notify "校园网自动重连失败，已尝试 ${cost} 秒，请检查网络"
-    fi
-}
-
-# 每天定时: 注销后重新登录
-relogin() {
-    log "执行每日重登"
-    logout
-    sleep 3
-    login
-    sleep 2
-    if is_online; then
-        log "每日重登完成, 网络正常"
-        notify "每日重登已完成，网络正常"
-    else
-        notify "每日重登失败，请检查网络"
-    fi
-}
-
-case "$1" in
-    check)   check ;;
-    login)   login ;;
-    logout)  logout ;;
-    relogin) relogin ;;
-    status)  is_online && echo online || echo offline ;;
-    *) echo "用法: $0 {check|login|logout|relogin|status}"; exit 1 ;;
-esac
 ```
+
+支持命令：`probe` / `check` / `login` / `logout` / `relogin` / `notify <msg>` / `status`。
 
 ### 4.2 守护进程 `campus_monitor.sh`
 
-```sh
-#!/bin/sh
-# 校园网实时监控守护进程, 每秒检测一次
-INTERVAL=1
-AUTH_SCRIPT="/etc/xiaoyuan/campus_auth.sh"
+完整脚本见仓库 `campus_monitor.sh`。核心逻辑：
 
+```sh
 while true; do
-    if [ "$($AUTH_SCRIPT status)" != "online" ]; then
-        $AUTH_SCRIPT check
+    $AUTH_SCRIPT probe
+    RC=$?
+    if [ $RC -eq 0 ]; then
+        # 在线, 无事发生
+        FAIL_COUNT=0; LAST_OK=$NOW
+    elif [ $RC -eq 1 ]; then
+        # 掉线瞬间被本次探测自动登录, 已恢复 → 通知含耗时
+        COST=$(awk "BEGIN{printf \"%.2f\", $NOW - $LAST_OK}")
+        "$AUTH_SCRIPT" notify "校园网掉线，已自动重连成功，断线到重连耗时 ${COST} 秒"
+        FAIL_COUNT=0; LAST_OK=$NOW
+    elif [ $RC -eq 3 ]; then
+        # 网关不可达(链路问题) → 外网兜底, 连续失败才处理
+        ...
+    else
+        # 登录失败(账号/密码等) → 连续失败才处理
+        ...
     fi
     sleep $INTERVAL
 done
 ```
 
 ### 4.3 procd 服务 `/etc/init.d/campus_monitor`
+
+完整内容见仓库 `campus_monitor.init`，核心：
 
 ```sh
 #!/bin/sh /etc/rc.common
@@ -311,7 +265,7 @@ mkdir -p /etc/xiaoyuan
 chmod +x /etc/xiaoyuan/campus_auth.sh /etc/xiaoyuan/campus_monitor.sh
 
 # 2. 安装 procd 服务并设置开机自启
-# 把 campus_monitor 传到 /etc/init.d/
+# 把 campus_monitor.init 传到 /etc/init.d/campus_monitor
 chmod +x /etc/init.d/campus_monitor
 /etc/init.d/campus_monitor enable
 /etc/init.d/campus_monitor start
@@ -319,11 +273,14 @@ chmod +x /etc/init.d/campus_monitor
 # 3. 语法检查(可选)
 sh -n /etc/xiaoyuan/campus_auth.sh
 sh -n /etc/xiaoyuan/campus_monitor.sh
+
+# 4. 验证探测
+/etc/xiaoyuan/campus_auth.sh probe && echo "在线" || echo "离线/自愈"
 ```
 
 ### 4.5 定时注销重登（cron）
 
-编辑 `/etc/crontabs/root`，加入（每天 8:00 重登、8:30 状态报告，可选）：
+编辑 `/etc/crontabs/root`，加入（每天 8:00 重登）：
 
 ```cron
 # 校园网每天8点注销重登
@@ -338,183 +295,13 @@ sh -n /etc/xiaoyuan/campus_monitor.sh
 
 ### 5.1 Python 跨平台脚本（Windows / macOS / Linux 通用）
 
-依赖：Python 3（标准库即可，无需安装第三方包）。
-
-```python
-#!/usr/bin/env python3
-# 校园网自动登录 / 断线重连 (跨平台)
-import time
-import urllib.request
-import urllib.parse
-import subprocess
-import platform
-import json
-
-# ---------------- 配置区 ----------------
-ACCOUNT = "2025xxxxxx"           # 学号/工号(不含运营商后缀)
-PASSWORD = "xxxxxxxx"            # 密码
-OPERATOR = "telecom"             # 运营商: telecom(电信)/cmcc(移动)/unicom(联通); 无运营商则留空
-GATEWAY = "10.255.254.1"         # 认证服务器IP
-PORT = "801"
-INTERVAL = 1                     # 检测间隔(秒)
-WECOM_WEBHOOK = ""               # 企业微信机器人, 留空不通知
-# ----------------------------------------
-
-
-def http_get(url, timeout=8):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read().decode("utf-8", "ignore")
-
-
-def get_local_info():
-    """获取本机默认网卡的 IP 和 MAC(跨平台)"""
-    ip = mac = ""
-    sysname = platform.system()
-    if sysname == "Windows":
-        out = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True).stdout
-        # 简单解析, 也可改用 netifaces / psutil
-        for block in out.split("\n\n"):
-            if "默认网关" in block or "Default Gateway" in block:
-                for line in block.splitlines():
-                    s = line.strip()
-                    if s.startswith("IPv4") or s.startswith("物理地址"):
-                        pass
-    # 更稳妥的方式: 用一个 UDP socket 得到出口 IP
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.254.1", 80))
-        ip = s.getsockname()[0]
-    finally:
-        s.close()
-    # MAC: 通过读取系统网卡信息(此处用 uuid.getnode, 需注意取到的网卡)
-    mac = "%012X" % uuid.getnode()
-    return ip, mac
-
-
-import uuid
-
-
-def is_online():
-    """HTTP 探测: 百度 200 或 generate_204 返回 204"""
-    for url, expect in [
-        ("http://www.baidu.com", 200),
-        ("http://connect.rom.miui.com/generate_204", 204),
-    ]:
-        try:
-            with urllib.request.urlopen(url, timeout=4) as r:
-                if r.status == expect:
-                    return True
-        except Exception:
-            pass
-    return False
-
-
-def login():
-    ip, mac = get_local_info()
-    full_acct = ACCOUNT + ("@" + OPERATOR if OPERATOR else "")
-    acct = urllib.parse.quote(full_acct, safe="")
-    url = (f"http://{GATEWAY}:{PORT}/eportal/?c=Portal&a=login"
-           f"&callback=dr1003&login_method=1"
-           f"&user_account=%2C0%2C{acct}&user_password={PASSWORD}"
-           f"&wlan_user_ip={ip}&wlan_user_mac={mac}"
-           f"&jsVersion=3.3.2&v=8980")
-    resp = http_get(url)
-    return '"result":"1"' in resp, resp
-
-
-def logout():
-    ip, mac = get_local_info()
-    url = (f"http://{GATEWAY}:{PORT}/eportal/?c=Portal&a=logout"
-           f"&callback=dr1004&login_method=1"
-           f"&user_account=drcom&user_password=123&ac_logout=1"
-           f"&wlan_user_ip={ip}&wlan_user_mac={mac}&v=850")
-    resp = http_get(url)
-    return '"result":"1"' in resp
-
-
-def notify(text):
-    if not WECOM_WEBHOOK:
-        return
-    data = json.dumps({"msgtype": "text",
-                       "text": {"content": time.strftime("%Y-%m-%d %H:%M:%S ") + text}}
-    ).encode()
-    req = urllib.request.Request(WECOM_WEBHOOK, data=data,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=8)
-    except Exception:
-        pass
-
-
-def main():
-    while True:
-        if not is_online():
-            t0 = time.time()
-            ok, _ = login()
-            # 等待恢复, 最多15秒
-            for _ in range(15):
-                if is_online():
-                    break
-                time.sleep(1)
-            cost = time.time() - t0
-            if is_online():
-                notify(f"校园网掉线，已自动重连成功，断线到重连耗时 {cost:.2f} 秒")
-            else:
-                notify(f"校园网自动重连失败，已尝试 {cost:.2f} 秒，请检查网络")
-        time.sleep(INTERVAL)
-
-
-if __name__ == "__main__":
-    main()
-```
+完整脚本见仓库 `campus_pc.py`（依赖 Python 3 标准库，无需第三方包）。逻辑与路由器版一致：每 `INTERVAL` 秒调用 `probe_auto()`，返回 1 表示掉线且本次已自动登录，发通知含耗时；网关不可达或登录失败时走外网兜底，连续失败才告警。
 
 让脚本常驻：
-- **Windows**：把脚本放进开机启动，或用"任务计划程序"新建任务 → 触发器"登录时"→操作运行 `pythonw 脚本路径`；
-- **macOS / Linux**：`nohup python3 campus.py &`，或写成 systemd / launchd 服务。
+- **Windows**：把脚本放进开机启动，或用"任务计划程序"新建任务 → 触发器"登录时"→ 操作运行 `pythonw 脚本路径`；
+- **macOS / Linux**：`nohup python3 campus_pc.py &`，或写成 systemd / launchd 服务。
 
-### 5.2 Windows PowerShell 轻量版
-
-```powershell
-# campus.ps1 —— 校园网自动重连
-$Account = "2025xxxxxx"          # 学号/工号(不含运营商后缀)
-$Password = "xxxxxxxx"
-$Operator = "telecom"            # 运营商: telecom/cmcc/unicom; 无运营商则留空
-$Gateway = "10.255.254.1"
-$Port = "801"
-
-function Get-WanInfo {
-    $ip = (Get-NetIPConfiguration | Where-Object {
-        $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up"
-    } | Select-Object -First 1).IPv4Address.IPAddress
-    $mac = ((Get-NetAdapter | Where-Object Status -eq "Up" |
-        Select-Object -First 1).MacAddress -replace ":", "").ToUpper()
-    return @{ Ip = $ip; Mac = $mac }
-}
-
-function Test-Online {
-    try {
-        $r = Invoke-WebRequest -Uri "http://www.baidu.com" `
-            -TimeoutSec 4 -MaximumRedirection 0 -UseBasicParsing
-        return $r.StatusCode -eq 200
-    } catch { return $false }
-}
-
-while ($true) {
-    if (-not (Test-Online)) {
-        $info = Get-WanInfo
-        $fullAcct = $Account + $(if ($Operator) { "@" + $Operator } else { "" })
-        $acct = [uri]::EscapeDataString($fullAcct)
-        $url = "http://${Gateway}:${Port}/eportal/?c=Portal&a=login" +
-            "&callback=dr1003&login_method=1" +
-            "&user_account=%2C0%2C$acct&user_password=$Password" +
-            "&wlan_user_ip=$($info.Ip)&wlan_user_mac=$($info.Mac)" +
-            "&jsVersion=3.3.2&v=8980"
-        Invoke-WebRequest -Uri $url -TimeoutSec 10 -UseBasicParsing | Out-Null
-    }
-    Start-Sleep -Seconds 1
-}
-```
+> ⚠️ 电脑直连校园网（网线插墙 / 连校园 WiFi）时用。如果电脑在路由器下面（拿内网 IP），`wlan_user_ip` 会是 192.168.x.x，网关会拒绝——此时应该用路由器方案。
 
 ---
 
@@ -538,12 +325,14 @@ while ($true) {
 ## 七、常见问题与注意事项
 
 1. **IP / MAC 不要写死。** 校园网 WAN IP 由 DHCP 动态分配，重启或重新认证后可能变化；写死会导致脚本突然失效。务必每次登录前动态获取。
-2. **用 HTTP 探测，而不是只 ping。** 部分校园网掉线时只拦截 HTTP / 应用流量，ICMP（ping）依然能通，纯 ping 检测会漏判。
-3. **端口与路径边界。** 学生认证只调用 `/eportal/?c=Portal&a=login|logout`；不要访问后台管理路径（如 `?c=main`），以免误操作。
-4. **已在线返回 `ret_code:2` 是正常的**，不代表登录失败；只有出现 `"result":"1"` 才是本次认证成功。
-5. **检测频率。** 路由器 busybox 的 `sleep` 通常只支持整数秒，1 秒一次是兼顾实时性与资源占用的合理选择；实测断线到重连约 1~3 秒。
-6. **运营商按套餐选择**：电信填 `telecom`、移动填 `cmcc`、联通填 `unicom`，脚本会自动拼成 `学号@运营商`；选错会登录失败。不确定时先在网页端登录一次，看浏览器地址栏里完整账号的后缀是什么。单运营商学校（无需后缀）把 `OPERATOR` 留空即可。
-7. **合规使用。** 本项目仅用于学习交流与个人网络维护，请遵守学校网络管理规定，不要用于绕过计费或共享账号。
+2. **登录接口探测是幂等的。** 在线时调用登录接口返回 `ret_code:2`，网关只是查表返回状态，不会重新认证、踢你下线或重复计费。每 5 秒一次的探测对网关压力可忽略（单次内网毫秒级请求）。
+3. **`ret_code:1` 是 IP 不匹配。** 如果你把 `wlan_user_ip` 填成内网地址（192.168.x.x），网关会返回 `ret_code:1` 拒绝。脚本只应在拿到校园网 IP 的设备上运行。
+4. **用登录接口探测，而不是只 ping / 外网 HTTP。** 校园网掉线时可能只拦 HTTP 而放行 ICMP；外网探测要等超时且受外网抖动影响。登录接口探测最准、最快、且自带自愈。
+5. **已在线返回 `ret_code:2` 是正常的**，不代表登录失败；只有出现 `"result":"1"` 才是本次认证成功。
+6. **检测频率。** 默认 5 秒一次（路由器 busybox 的 `sleep` 通常只支持整数秒）。想更快改 `INTERVAL=1`，但 5 秒已兼顾实时性与资源占用；实测掉线到重连约 5 秒内。
+7. **运营商按套餐选择**：电信填 `telecom`、移动填 `cmcc`、联通填 `unicom`，脚本会自动拼成 `学号@运营商`；选错会登录失败。不确定时先在网页端登录一次，看浏览器地址栏里完整账号的后缀是什么。单运营商学校（无需后缀）把 `OPERATOR` 留空即可。
+8. **端口与路径边界。** 学生认证只调用 `/eportal/?c=Portal&a=login|logout`；不要访问后台管理路径（如 `?c=main`），以免误操作。
+9. **合规使用。** 本项目仅用于学习交流与个人网络维护，请遵守学校网络管理规定，不要用于绕过计费或共享账号。
 
 ---
 
