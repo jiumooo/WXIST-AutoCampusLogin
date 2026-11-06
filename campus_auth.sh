@@ -115,7 +115,8 @@ probe_auto() {
     local enc_acct url resp
     enc_acct=$(full_account | sed 's/@/%40/g')
     url="http://${GATEWAY}:${PORT}/eportal/?c=Portal&a=login&callback=dr1003&login_method=1&user_account=%2C0%2C${enc_acct}&user_password=${PASSWORD}&wlan_user_ip=${WAN_IP}&wlan_user_mac=${WAN_MAC}&jsVersion=3.3.2&v=8980"
-    resp=$(curl -s -m 3 "$url")
+    # 统一走 http_get: curl → wget → uclient-fetch 自动降级, 避免固件未装 curl 时探测失效
+    resp=$(http_get "$url")
     [ -z "$resp" ] && return 3
     echo "$resp" | grep -q '"ret_code":2' && return 0
     echo "$resp" | grep -q '"result":"1"' && return 1
